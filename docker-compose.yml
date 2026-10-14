@@ -1,24 +1,21 @@
 version: "3.8"
 
 services:
-  app:
-    build: .
+  studio-enfeca:
+    image: studio-enfeca:latest
+    container_name: studio-enfeca
     ports:
-      # Host nginx proxies divstudio.enfeca.com → 127.0.0.1:8092
       - "8092:3000"
     env_file:
-      - .env.production
+      - /opt/divstudio/.env.production
     environment:
       PORT: "3000"
       ENFEC_DATA_ROOT: /var/lib/divstudio/data
       ENFEC_SCRATCH_ROOT: /var/lib/divstudio/scratch
       PLAYWRIGHT_BROWSERS_PATH: /opt/playwright
       FFMPEG_PATH: /usr/bin/ffmpeg
-      # Kokoro "Heart" narration (Zero Code course) runs in the sidecar below.
       KOKORO_TTS_URL: http://kokoro:3333
       KOKORO_VOICE: af_heart
-      # Override host DNS (127.0.1.1) so Playwright can reach nginx on the gateway.
-      # Bumpers are host-served; EXPORT_BASE_URL must stay the public https origin.
     extra_hosts:
       - "divstudio.enfeca.com:host-gateway"
     volumes:
@@ -31,20 +28,17 @@ services:
   kokoro:
     build: ./deploy/kokoro
     ports:
-      # Host nginx proxies /kokoro-api/ → 127.0.0.1:8093 (used by divstudio.lovable.app)
       - "127.0.0.1:8093:3333"
     environment:
       PORT: "3333"
       HF_HOME: /var/lib/kokoro/hf
       KOKORO_DTYPE: q8
-      # One generation at a time; recycle the process when it grows or idles.
       KOKORO_THREADS: "2"
       KOKORO_MAX_RSS_MB: "1100"
       KOKORO_IDLE_RECYCLE_MIN: "45"
       KOKORO_CACHE_MAX_MB: "512"
     volumes:
       - kokoro_models:/var/lib/kokoro/hf
-    # Hard ceiling so the voice service can never starve the app container.
     mem_limit: 1300m
     memswap_limit: 2g
     restart: unless-stopped
@@ -53,5 +47,3 @@ volumes:
   divstudio_data:
   divstudio_scratch:
   kokoro_models:
-
-
