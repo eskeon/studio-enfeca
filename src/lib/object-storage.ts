@@ -1,4 +1,14 @@
-import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { Readable } from "node:stream";
 import path from "node:path";
 import { hostAppAssetsRoot, hostProjectAssetsRoot } from "@/lib/host-storage";
@@ -154,6 +164,101 @@ export async function putAsset(opts: {
   }
 
   const prefix = opts.kind === "app" ? "/api/app-assets" : "/api/assets";
+  return `${prefix}/${rel}`;
+}
+
+/**
+ * PUT a file to an already-signed URL without loading it into memory. Needs an
+ * explicit Content-Length: S3/Spaces reject chunked PUT bodies.
+ *
+ * This uses node:http(s) with a piped read stream rather than fetch(): Node's
+ * fetch reads a streamed request body as fast as it can with no backpressure, so
+ * memory grew with the size of the file (measured: ~1 GB for a 1.1 GB upload).
+ */
+export async function putFileToSignedUrl(
+  url: string,
+  filePath: string,
+  contentType: string,
+  timeoutMs = 30 * 60 * 1000,
+): Promise<void> {
+  const size = statSync(filePath).size;
+  const target = new URL(url);
+  const request = target.protocol === "http:" ? httpRequest : httpsRequest;
+
+  await new Promise<void>((resolve, reject) => {
+    const req = request(
+      target,
+      {
+        method: "PUT",
+        headers: { "Content-Type": contentType, "Content-Length": String(size) },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve();
+          } else {
+            const text = Buffer.concat(chunks).toString("utf8").slice(0, 500);
+            reject(new Error(`Asset upload failed [${res.statusCode}]: ${text}`));
+          }
+        });
+        res.on("error", reject);
+      },
+    );
+    req.on("timeout", () => req.destroy(new Error("Asset upload timed out")));
+    req.on("error", reject);
+    const file = createReadStream(filePath);
+    file.on("error", (e) => req.destroy(e));
+    file.pipe(req);
+  });
+}
+
+/**
+ * Store a file that is already on disk (e.g. a finished render) without holding
+ * it in memory. On Spaces it streams to a presigned URL; if that fails for any
+ * reason it falls back to the buffered upload putAsset() has always done, so the
+ * worst case is the previous behaviour.
+ */
+export async function putAssetFromFile(opts: {
+  kind: AssetKind;
+  relPath: string;
+  filePath: string;
+  contentType?: string;
+}): Promise<string> {
+  const rel = opts.relPath.replace(/^\/+/, "");
+  if (!rel || rel.includes("..")) throw new Error("Invalid asset path");
+  const prefix = opts.kind === "app" ? "/api/app-assets" : "/api/assets";
+  const contentType = opts.contentType ?? "application/octet-stream";
+
+  const buffered = () =>
+    putAsset({
+      kind: opts.kind,
+      relPath: rel,
+      body: readFileSync(opts.filePath),
+      contentType: opts.contentType,
+    });
+
+  if (useCloudStorage() || (useSpaces() && isEdgeRuntime())) return buffered();
+
+  if (useSpaces()) {
+    try {
+      const url = await spacesPresign("PUT", opts.kind, rel, 3600);
+      await putFileToSignedUrl(url, opts.filePath, contentType);
+      return `${prefix}/${rel}`;
+    } catch (e) {
+      console.warn(
+        "[assets] streamed upload failed, retrying buffered:",
+        e instanceof Error ? e.message : e,
+      );
+      return buffered();
+    }
+  }
+
+  const full = path.join(localRoot(opts.kind), rel);
+  mkdirSync(path.dirname(full), { recursive: true });
+  copyFileSync(opts.filePath, full);
   return `${prefix}/${rel}`;
 }
 
