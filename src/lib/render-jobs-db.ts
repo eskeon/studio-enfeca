@@ -274,6 +274,22 @@ const PG_SELECT = `
   finished_at::text AS finished_at, output_url, error, payload
 `;
 
+/** Same columns without the frozen payload (can be megabytes per job); list views never read it. */
+const PG_SELECT_LIST = `
+  id, course_id, project_id, part_id, episode_title, part_title,
+  requested_by_user_id, requested_by_email, duration_ms, scene_count, status,
+  progress, stage, machine, created_at::text AS created_at,
+  claimed_at::text AS claimed_at, heartbeat_at::text AS heartbeat_at,
+  finished_at::text AS finished_at, output_url, error, '{}'::jsonb AS payload
+`;
+
+const SQLITE_SELECT_LIST = `
+  id, course_id, project_id, part_id, episode_title, part_title,
+  requested_by_user_id, requested_by_email, duration_ms, scene_count, status,
+  progress, stage, machine, created_at, claimed_at, heartbeat_at, finished_at,
+  output_url, error, '{}' AS payload
+`;
+
 function pgRow(row: Record<string, unknown>): RenderJobRow {
   const raw = row.payload;
   let payload: unknown = raw ?? {};
@@ -368,8 +384,16 @@ export async function getRenderJob(id: string): Promise<RenderJobRow | null> {
   return row ? sqliteRow(row) : null;
 }
 
+/** The sweep is an UPDATE; the Export page polls every few seconds from every open tab. */
+const STALE_SWEEP_MIN_INTERVAL_MS = 10_000;
+let lastStaleSweepAt = 0;
+
 /** Put timed-out renders back into the queue so another machine can take them. */
-export async function requeueStaleJobs(): Promise<void> {
+export async function requeueStaleJobs(opts?: { force?: boolean }): Promise<void> {
+  // Timeouts are minutes long, so sweeping more than every few seconds finds nothing new.
+  const now = Date.now();
+  if (!opts?.force && now - lastStaleSweepAt < STALE_SWEEP_MIN_INTERVAL_MS) return;
+  lastStaleSweepAt = now;
   const cutoff = new Date(Date.now() - HEARTBEAT_TIMEOUT_MS).toISOString();
   if (usePostgres()) {
     await ensurePgTable();
@@ -428,7 +452,7 @@ export async function listRenderJobs(opts?: {
   if (usePostgres()) {
     await ensurePgTable();
     const res = await pgQuery(
-      `SELECT ${PG_SELECT} FROM render_jobs ${whereSql}
+      `SELECT ${PG_SELECT_LIST} FROM render_jobs ${whereSql}
        ORDER BY created_at DESC LIMIT ${limit}`,
       params,
     );
@@ -436,7 +460,7 @@ export async function listRenderJobs(opts?: {
   }
   const rows = getDb()
     .prepare(
-      `SELECT * FROM render_jobs ${whereSql} ORDER BY created_at DESC LIMIT ${limit}`,
+      `SELECT ${SQLITE_SELECT_LIST} FROM render_jobs ${whereSql} ORDER BY created_at DESC LIMIT ${limit}`,
     )
     .all(...params) as Record<string, unknown>[];
   return rows.map(sqliteRow);
@@ -496,6 +520,19 @@ export async function heartbeatRenderJob(
   if (current.status === "cancelled") return current;
   // A finished render stays finished — late heartbeats must not reopen it.
   if (current.status === "done") return current;
+  // Same for a failed one: a progress report still in flight when the machine
+  // reported the failure used to flip it back to "rendering" with nobody on it.
+  if (current.status === "failed") return current;
+  // If another machine has taken this job over, a late heartbeat from the first
+  // one must not rename it or overwrite the new machine's progress.
+  if (
+    current.status === "rendering" &&
+    current.machine &&
+    patch.machine &&
+    current.machine !== patch.machine
+  ) {
+    return current;
+  }
   const now = new Date().toISOString();
   const progress = Math.max(0, Math.min(1, patch.progress ?? current.progress));
   const stage = patch.stage ?? current.stage;
