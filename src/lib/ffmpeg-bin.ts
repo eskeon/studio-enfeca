@@ -21,20 +21,40 @@ function canSpawnProcesses(): boolean {
   return processSpawnSupported;
 }
 
+/**
+ * `ffmpeg -version` blocks the whole server while it runs, and every ffmpeg or
+ * ffprobe call used to repeat it. A binary that works keeps working, so remember
+ * it for the life of the process; a failure is only remembered briefly so that
+ * installing ffmpeg later is still picked up.
+ */
+const FFMPEG_OK = new Set<string>();
+const FFMPEG_FAILED_AT = new Map<string, number>();
+const FFMPEG_RETRY_MS = 60_000;
+
 /** True when this path is a runnable ffmpeg for the current CPU. */
 function canRunFfmpeg(bin: string): boolean {
   if (!bin || (bin !== "ffmpeg" && !existsSync(bin))) return false;
+  if (FFMPEG_OK.has(bin)) return true;
+  const failedAt = FFMPEG_FAILED_AT.get(bin);
+  if (failedAt !== undefined && Date.now() - failedAt < FFMPEG_RETRY_MS) return false;
+  let ok = false;
   try {
     const r = spawnSync(bin, ["-version"], {
       encoding: "utf8",
       timeout: 8_000,
     });
     // macOS Apple Silicon + Intel binary → errno -86 (EBADARCH)
-    if (r.error) return false;
-    return r.status === 0;
+    ok = !r.error && r.status === 0;
   } catch {
-    return false;
+    ok = false;
   }
+  if (ok) {
+    FFMPEG_OK.add(bin);
+    FFMPEG_FAILED_AT.delete(bin);
+  } else {
+    FFMPEG_FAILED_AT.set(bin, Date.now());
+  }
+  return ok;
 }
 
 function ffmpegStaticPath(): string | null {
